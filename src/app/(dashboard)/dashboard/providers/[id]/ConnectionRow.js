@@ -33,6 +33,10 @@ export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst
   }, [connection]);
 
   const proxyPoolMap = new Map((proxyPools || []).map((pool) => [pool.id, pool]));
+  // Saved single-pool binding (legacy single-select) falls back to first of the
+  // fork's multi-selection so render reflects whatever is persisted.
+  const boundProxyPoolId = connection.providerSpecificData?.proxyPoolId || selectedProxyIds[0] || null;
+  const boundProxyPool = boundProxyPoolId ? proxyPoolMap.get(boundProxyPoolId) : null;
   
   // Display logic - support both new (multi-proxy) and legacy (single proxy) formats
   const hasLegacyProxy = connection.providerSpecificData?.connectionProxyEnabled === true && !!connection.providerSpecificData?.connectionProxyUrl;
