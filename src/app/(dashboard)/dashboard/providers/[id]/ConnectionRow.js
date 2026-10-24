@@ -376,11 +376,13 @@ export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst
                   >
                     None
                   </button>
-                  {(proxyPools || []).map((pool) => (
-                    <button
-                      key={pool.id}
-                      onClick={() => handleSelectProxy(pool.id)}
-                      className={`w-full text-left px-3 py-1.5 text-sm hover:bg-black/5 dark:hover:bg-white/5 ${boundProxyPoolId === pool.id ? "text-primary font-medium" : "text-text-main"}`}
+                  {/* Rotation Strategy Selector */}
+                  <div className="border-b border-border p-3">
+                    <label className="block text-xs font-medium text-text-muted mb-2">Rotation Strategy</label>
+                    <select
+                      value={rotationStrategy}
+                      onChange={(e) => handleStrategyChange(e.target.value)}
+                      className="w-full rounded border border-border bg-bg px-2 py-1.5 text-sm text-text-main focus:border-primary focus:outline-none"
                     >
                       <option value="none">None (Single Proxy)</option>
                       <option value="random">Random</option>
@@ -414,7 +416,77 @@ export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst
                         <span>None</span>
                       </div>
                     </button>
-                  ))}
+
+                    {rotationStrategy !== "none" && (
+                      <button
+                        onClick={() => {
+                          const activePoolIds = (proxyPools || [])
+                            .filter(pool => pool.isActive === true)
+                            .map(pool => pool.id);
+                          const allSelected = activePoolIds.length > 0 && activePoolIds.every(id => selectedProxyIds.includes(id));
+
+                          if (allSelected) {
+                            setSelectedProxyIds([]);
+                          } else {
+                            setSelectedProxyIds(activePoolIds);
+                          }
+                        }}
+                        className={`w-full text-left px-3 py-2 text-sm border-b border-border hover:bg-black/5 dark:hover:bg-white/5 ${selectedProxyIds.length === (proxyPools || []).filter(p => p.isActive).length ? "bg-black/5 dark:bg-white/5" : ""}`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className="material-symbols-outlined text-[16px]">
+                            {selectedProxyIds.length === (proxyPools || []).filter(p => p.isActive).length && selectedProxyIds.length > 0
+                              ? "check_box"
+                              : "check_box_outline_blank"
+                            }
+                          </span>
+                          <span className="font-medium">Select All Active</span>
+                        </div>
+                      </button>
+                    )}
+
+                    {(proxyPools || []).map((pool) => {
+                      const isSelected = selectedProxyIds.includes(pool.id);
+                      const isActive = pool.isActive === true;
+                      return (
+                        <button
+                          key={pool.id}
+                          onClick={() => {
+                            if (rotationStrategy === "none") {
+                              setSelectedProxyIds([pool.id]);
+                            } else {
+                              handleToggleProxySelection(pool.id);
+                            }
+                          }}
+                          className={`w-full text-left px-3 py-2 text-sm hover:bg-black/5 dark:hover:bg-white/5 ${isSelected ? "bg-black/5 dark:bg-white/5" : ""}`}
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className="material-symbols-outlined text-[16px]">
+                              {rotationStrategy === "none"
+                                ? (isSelected ? "radio_button_checked" : "radio_button_unchecked")
+                                : (isSelected ? "check_box" : "check_box_outline_blank")
+                              }
+                            </span>
+                            <span className={isSelected ? "text-primary font-medium" : "text-text-main"}>{pool.name}</span>
+                            {!isActive && (
+                              <span className="ml-auto text-[10px] text-red-500">(inactive)</span>
+                            )}
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Apply Button */}
+                  <div className="border-t border-border p-2">
+                    <button
+                      onClick={handleApplyProxyChanges}
+                      disabled={updatingProxy}
+                      className="w-full rounded bg-primary px-3 py-2 text-sm font-medium text-white hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {updatingProxy ? "Applying..." : "Apply"}
+                    </button>
+                  </div>
                 </div>,
                 document.body
               )}
