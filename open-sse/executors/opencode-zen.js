@@ -1,8 +1,7 @@
 import crypto from "node:crypto";
 import { DefaultExecutor } from "./default.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
-import { isMuseSparkModel } from "../providers/models/helpers.js";
-import { MEMORY_CONFIG } from "../config/runtimeConfig.js";
+import { isMuseSparkModel, isOpencodeFreeTierModel } from "../providers/models/helpers.js";
 import {
   normalizeResponsesInput,
   clampResponsesCallId,
@@ -44,54 +43,16 @@ function unstableRandom() {
 // Upstream decodes it and rejects a non-small counter with 403 FreeTierError
 // (live probes: counter 0–16 pass, >=100 fail), so the counter must stay real.
 const SESSION_PREFIX_MASK = (1n << 48n) - 1n;
-
-function descendingTimeHex(time, counterValue) {
-  return (~(BigInt(time) * 0x1000n + BigInt(counterValue)) & SESSION_PREFIX_MASK)
-    .toString(16)
-    .padStart(12, "0");
-}
-
-export function generateSessionId(timestamp = Date.now()) {
-  return `ses_${descendingTimeHex(timestamp, 1)}${unstableRandom()}`;
-}
-
-export function generateRequestId(timestamp = Date.now()) {
-  const current = BigInt(timestamp) * 0x1000n + 1n;
-  const value = current;
-  const time = Array.from({ length: 6 }, (_, index) =>
-    Number((value >> BigInt(40 - 8 * index)) & 0xffn)
-      .toString(16)
-      .padStart(2, "0")
-  ).join("");
-  return `msg_${time}${unstableRandom()}`;
-}
-
-// One upstream session per (clientTool, downstream session) so a conversation
-// keeps a single id; minting a new one per request burns the free-tier quota
-// (429 FreeUsageLimitError).
-const translatedZenSessions = new Map();
-const MAX_TRANSLATED_SESSIONS = 1000;
-const translatedZenSessionCleanup = setInterval(() => {
-  const now = Date.now();
-  for (const [key, entry] of translatedZenSessions) {
-    if (now - entry.lastUsed > MEMORY_CONFIG.sessionTtlMs) {
-      translatedZenSessions.delete(key);
-    }
-  }
-}, MEMORY_CONFIG.sessionCleanupIntervalMs);
-if (translatedZenSessionCleanup.unref) translatedZenSessionCleanup.unref();
-
-export function translateSessionId(sessionId, clientTool = "") {
-  if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
-    return sessionId.trim();
-  }
-  const key = `opencode-zen:ses:${clientTool || "generic"}:${sessionId || ""}`;
-  const existing = translatedZenSessions.get(key);
-  if (existing) {
-    existing.lastUsed = Date.now();
-    translatedZenSessions.delete(key);
-    translatedZenSessions.set(key, existing);
-    return existing.sessionId;
+  const digest = crypto
+    .createHash("sha256")
+    .update(`opencode\0${clientTool || "generic"}\0${sessionId || ""}`)
+    .digest();
+  // Deterministic time field from the digest, counter pinned to 1 (what the CLI sends).
+  const time = BigInt(`0x${digest.subarray(0, 5).toString("hex")}`) & SESSION_TIME_MASK;
+  const timeHex = descendingTimeHex(time, 1);
+  let randomPart = "";
+  for (let i = 6; i < 20; i++) {
+    randomPart += BASE62_CHARS[digest[i] % 62];
   }
   const id = generateSessionId();
   if (translatedZenSessions.size >= MAX_TRANSLATED_SESSIONS) {
@@ -291,14 +252,22 @@ export class OpenCodeZenExecutor extends DefaultExecutor {
     // Free-tier gate: spoof the official client UA.
     headers["User-Agent"] = hasValidOpencodeVersion(downstreamUa) ? downstreamUa : OPENCODE_UA;
     headers["x-opencode-client"] = lower["x-opencode-client"] || "desktop";
+    headers["x-opencode-project"] = lower["x-opencode-project"] || "global";
     const prepared = credentials?.[SESSION_FIELD];
     if (prepared) {
       headers[SESSION_HEADER] = prepared;
-      return headers;
+    } else {
+      const fallback = this.prepareRequestCredentials({ credentials });
+      headers[SESSION_HEADER] = fallback[SESSION_FIELD];
     }
-
-    const fallback = this.prepareRequestCredentials({ credentials });
-    headers[SESSION_HEADER] = fallback[SESSION_FIELD];
+    if (isOpencodeFreeTierModel(model)) {
+      // Free-tier models are gated behind the attested free-tier identity even
+      // on the keyed lane: a real oc_sk_* key answers 403 FreeTierError, while
+      // `Bearer public` + session/request ids succeed. Paid models keep the
+      // connection key untouched.
+      headers["Authorization"] = "Bearer public";
+      headers["x-opencode-request"] = generateRequestId();
+    }
     return headers;
   }
 

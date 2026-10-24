@@ -53,28 +53,6 @@ function unstableRandom() {
 // Upstream decodes it and rejects a non-small counter with 403 FreeTierError
 // (live probes: counter 0–16 pass, >=100 fail), so the counter must stay real.
 const SESSION_PREFIX_MASK = (1n << 48n) - 1n;
-
-function descendingTimeHex(time, counterValue) {
-  return (~(BigInt(time) * 0x1000n + BigInt(counterValue)) & SESSION_PREFIX_MASK)
-    .toString(16)
-    .padStart(12, "0");
-}
-
-export function generateSessionId(timestamp = Date.now()) {
-  if (timestamp !== lastTimestamp) {
-    lastTimestamp = timestamp;
-    counter = 0;
-  }
-  counter++;
-  return `ses_${descendingTimeHex(timestamp, counter)}${unstableRandom()}`;
-}
-
-// Mint a canonical session id from the real clock. The 12-hex prefix must
-// decode to a recent timestamp — Zen rejects a prefix built from anything else
-// (hash bits) with 403 FreeTierError — and the counter must stay small
-// (upstream probes: 0-16 pass, >=100 fail), so pin it to 1.
-function mintSessionId() {
-  return `ses_${descendingTimeHex(Date.now(), 1)}${unstableRandom()}`;
 }
 
 // One upstream session per (clientTool, downstream session) so a conversation
@@ -343,21 +321,15 @@ function normalizeOpencodeReasoning(model, body) {
   delete body.reasoning_effort;
 }
 
-// OpenCode free tier is limited per egress IP — a 429/403 with a limit-ish
-// body means the POOL's IP is exhausted, not the account. Declare it
-// pool-scoped so chatCore marks the pool unfit, retries via another pool, and
-// it shows up (clearable) on the Proxy Fitness page.
-const IP_LIMIT_BODY = /limit|rate|quota|exhausted|capacity|too many|retry/i;
-
-// Reputation blocks: the gateway refuses the egress IP outright ("detected
-// abusive traffic", "not available from your current network"). Same remedy as
-// a rate limit — the POOL's egress is bad, another pool may be clean — but the
-// body carries none of the words above, so it needs its own pattern.
-//
-// Deliberately NOT matched: the fingerprint 403 ("free tier can only be used
-// from within OpenCode"). That is a client-shape problem no pool rotation can
-// fix; marking pools unfit there would just burn quota retrying clean IPs.
-const IP_BLOCK_BODY = /abusive traffic|from your current network/i;
+// Chat Completions lane: the free backend validates reasoning_effort against the
+// plain OpenAI enum (none|minimal|low|medium|high|xhigh|max) and answers 400
+// "Invalid option" for anything else — including "auto", which adaptive thinking
+// (Claude Code's thinking:{type:"adaptive"}) arrives as. Omitting the field lets
+// the upstream pick its own default, which is what adaptive means; same rationale
+// as the Responses path above, which rejects "unknown variant `auto`".
+function dropAdaptiveReasoningEffort(body) {
+  if (body?.reasoning_effort === "auto") delete body.reasoning_effort;
+}
 
 export class OpenCodeExecutor extends BaseExecutor {
   constructor() {
@@ -408,6 +380,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       // non-empty tool arrays; skipping cloaking here triggers 403 FreeTierError.
       applyFingerprintTools(body, true);
     } else if (body && typeof body === "object") {
+      dropAdaptiveReasoningEffort(body);
       applyFingerprintTools(body, false);
     }
     return injectReasoningContent({ provider: this.provider, model, body });

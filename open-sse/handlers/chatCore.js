@@ -24,6 +24,7 @@ import { dedupeTools } from "../utils/toolDeduper.js";
 import { takeRenamedToolNames } from "../utils/opencodeFingerprint.js";
 import { injectCaveman } from "../rtk/caveman.js";
 import { injectPonytail } from "../rtk/ponytail.js";
+import { injectCustomPrompt } from "../rtk/customPrompt.js";
 import { compressMessages, formatRtkLog } from "../rtk/index.js";
 import { compressWithHeadroom, formatHeadroomLog, formatHeadroomSizeLog, isHeadroomPhantomSavings } from "../rtk/headroom.js";
 import { compressWithPxpipe } from "../rtk/pxpipe.js";
@@ -66,7 +67,7 @@ export function stripContinuityFields(body) {
   return body;
 }
 
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, resolveProxyConfig, providerOverrides }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides }) {
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
   // Stable per-session color so all lines of one CLI conversation share a tag
@@ -116,7 +117,6 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const targetFormat = useTransport?.format || modelTargetFormat || getTargetFormat(provider, credentials);
   if (useTransport && credentials) credentials.runtimeTransport = useTransport;
   const stripList = getModelStrip(alias, model);
-  const upstreamModel = getModelUpstreamId(alias, model);
 
   // Inject provider-level thinking config override (only if client hasn't set)
   // on/off → extended type (body.thinking), none/low/medium/high → effort type (body.reasoning_effort)
@@ -131,6 +131,8 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
       body = { ...body, reasoning_effort: mode };
     }
   }
+
+  const upstreamModel = getModelUpstreamId(alias, model, body);
 
   // Per-request opt-out: client can bypass all token savers via header
   const tokenSaverEnabled = clientRawRequest?.headers?.[TOKEN_SAVER_HEADER]?.toLowerCase() !== "off";
@@ -293,7 +295,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   if (headroomLine) {
     log?.info?.("HEADROOM", `${headroomLine}${headroomSizeLine ? ` | ${headroomSizeLine}` : ""}`);
     if (isHeadroomPhantomSavings(headroomStats, headroomDiagnostics)) {
-      log?.warn?.("HEADROOM", `reported token delta, but outbound JSON shrank <5%; provider may bill near-original payload | ${formatHeadroomSizeLog(headroomDiagnostics)}`);
+      log?.warn?.("HEADROOM", `reported token delta, but messages and outbound JSON shrank <5% | ${formatHeadroomSizeLog(headroomDiagnostics)}`);
     }
   } else if (tokenSaverEnabled && headroomEnabled) log?.warn?.("HEADROOM", `skipped: ${headroomDiagnostics.reason || "compression unavailable"}${headroomDiagnostics.endpoint ? ` (${headroomDiagnostics.endpoint})` : ""}`);
 
@@ -312,6 +314,11 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   if (tokenSaverEnabled && ponytailEnabled && ponytailLevel) {
     injectPonytail(translatedBody, finalFormat, ponytailLevel);
     xf.push(`PONYTAIL:${ponytailLevel}`);
+  }
+
+  // Custom prompt: user-authored instruction, independent of the savers above
+  if (customPromptEnabled && injectCustomPrompt(translatedBody, finalFormat, customPrompt)) {
+    xf.push(`CUSTOMPROMPT:${customPrompt.trim().length}c`);
   }
 
   // PXPIPE: image bulky context (Claude-format bodies only), last saver before dispatch
@@ -349,40 +356,16 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     log, provider, model, reqTag
   });
 
-  // Build proxy options from the resolved provider-specific data. `strictProxy`
-  // is forced for freebuff so a dead/limited pool can never leak the request
-  // to the caller's real IP (the freebuff session tier is per-egress-IP).
-  const buildProxyOptions = (psd = {}) => ({
-    connectionProxyEnabled: psd?.connectionProxyEnabled === true,
-    connectionProxyUrl: psd?.connectionProxyUrl || "",
-    connectionNoProxy: psd?.connectionNoProxy || "",
-    vercelRelayUrl: psd?.vercelRelayUrl || "",
-    strictProxy: psd?.strictProxy === true || provider === "freebuff",
-    proxyPoolId: psd?.proxyPoolId || psd?.connectionProxyPoolId || null,
-  });
-
-  const proxyScope = `${provider}::${model}`;
-  let proxyOptions = buildProxyOptions(credentials?.providerSpecificData || {});
-
-  if (provider === "freebuff" && credentials?.providerSpecificData?.noFitPool === true) {
-    const error = new Error(`Freebuff has no healthy proxy pool for ${model}; all assigned pools are cooling down after limited-IP errors.`);
-    error.status = 503;
-    error.poolScoped = { poolId: null, scope: proxyScope, reason: "no_fit_pool" };
-    trackPendingRequest(model, provider, connectionId, false, true);
-    return createErrorResult(503, error.message);
-  }
-
-  if (
-    provider === "freebuff" &&
-    !proxyOptions.proxyPoolId &&
-    !proxyOptions.vercelRelayUrl &&
-    !(proxyOptions.connectionProxyEnabled && proxyOptions.connectionProxyUrl)
-  ) {
-    const error = new Error(`Freebuff requires a configured proxy pool for ${model}; direct egress is disabled to prevent limited-IP rate limits.`);
-    error.status = 503;
-    trackPendingRequest(model, provider, connectionId, false, true);
-    return createErrorResult(503, error.message);
-  }
+  const proxyOptions = {
+    connectionProxyEnabled: credentials?.providerSpecificData?.connectionProxyEnabled === true,
+    connectionProxyUrl: credentials?.providerSpecificData?.connectionProxyUrl || "",
+    connectionNoProxy: credentials?.providerSpecificData?.connectionNoProxy || "",
+    vercelRelayUrl: credentials?.providerSpecificData?.vercelRelayUrl || "",
+    // Strict pools must never silently fall back to a direct connection —
+    // honored on the Cursor AgentService h2 path and in proxyFetch (#4333).
+    proxyPoolId: credentials?.providerSpecificData?.connectionProxyPoolId || null,
+    strictProxy: credentials?.providerSpecificData?.strictProxy === true,
+  };
 
   if (proxyOptions.vercelRelayUrl) {
     const connectionName = credentials?.connectionName || credentials?.connectionId || "unknown";
