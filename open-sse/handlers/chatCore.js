@@ -67,7 +67,7 @@ export function stripContinuityFields(body) {
   return body;
 }
 
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, providerOverrides }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, customPromptEnabled, customPrompt, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, resolveProxyConfig, providerOverrides }) {
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
   // Stable per-session color so all lines of one CLI conversation share a tag
@@ -356,16 +356,28 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     log, provider, model, reqTag
   });
 
-  const proxyOptions = {
-    connectionProxyEnabled: credentials?.providerSpecificData?.connectionProxyEnabled === true,
-    connectionProxyUrl: credentials?.providerSpecificData?.connectionProxyUrl || "",
-    connectionNoProxy: credentials?.providerSpecificData?.connectionNoProxy || "",
-    vercelRelayUrl: credentials?.providerSpecificData?.vercelRelayUrl || "",
-    // Strict pools must never silently fall back to a direct connection —
-    // honored on the Cursor AgentService h2 path and in proxyFetch (#4333).
-    proxyPoolId: credentials?.providerSpecificData?.connectionProxyPoolId || null,
-    strictProxy: credentials?.providerSpecificData?.strictProxy === true,
-  };
+  // Build proxy options from the resolved provider-specific data. `strictProxy`
+  // is forced for freebuff so a dead/limited pool can never leak the request
+  // to the caller's real IP (the freebuff session tier is per-egress-IP).
+  const buildProxyOptions = (psd = {}) => ({
+    connectionProxyEnabled: psd?.connectionProxyEnabled === true,
+    connectionProxyUrl: psd?.connectionProxyUrl || "",
+    connectionNoProxy: psd?.connectionNoProxy || "",
+    vercelRelayUrl: psd?.vercelRelayUrl || "",
+    strictProxy: psd?.strictProxy === true || provider === "freebuff",
+    proxyPoolId: psd?.proxyPoolId || psd?.connectionProxyPoolId || null,
+  });
+
+  const proxyScope = `${provider}::${model}`;
+  let proxyOptions = buildProxyOptions(credentials?.providerSpecificData || {});
+
+  if (provider === "freebuff" && credentials?.providerSpecificData?.noFitPool === true) {
+    const error = new Error(`Freebuff has no healthy proxy pool for ${model}; all assigned pools are cooling down after limited-IP errors.`);
+    error.status = 503;
+    error.poolScoped = { poolId: null, scope: proxyScope, reason: "no_fit_pool" };
+    trackPendingRequest(model, provider, connectionId, false, true);
+    return createErrorResult(503, error.message);
+  }
 
   if (proxyOptions.vercelRelayUrl) {
     const connectionName = credentials?.connectionName || credentials?.connectionId || "unknown";
