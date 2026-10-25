@@ -152,7 +152,12 @@ const OAUTH_TEST_CONFIG = {
     method: "GET",
     authHeader: "Authorization",
     authPrefix: "Bearer ",
-    extraHeaders: { Accept: "application/json", "User-Agent": "codebuff-cli/0.0.138" },
+    extraHeaders: {
+      Accept: "application/json",
+      "User-Agent": "codebuff-cli/0.2.34",
+      "x-freebuff-client": "cli",
+      "x-freebuff-client-version": "0.2.34",
+    },
     acceptStatuses: [403, 404],
     softFailMessage: {
       403: "Connected, but Freebuff is gated (403) — country blocked or account banned.",

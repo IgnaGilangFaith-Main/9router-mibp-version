@@ -52,15 +52,26 @@ describe("AUDIT-002: API key masking", () => {
     expect(livePath.length).toBeGreaterThanOrEqual(1);
   });
 
-  it("byApiKey object keys should use masked key, not raw key", () => {
+  it("byApiKey buckets expose a masked key, never the raw key", () => {
     const source = fs.readFileSync(
       path.resolve(REPO_ROOT, "src/lib/db/repos/usageRepo.js"),
       "utf-8"
     );
-    // The 24h path should use apiKeyMasked in the akKey template
-    expect(source).toContain("${apiKeyMasked}|${r.model}|${r.provider");
-    // Should NOT use raw r.apiKey in the key
-    expect(source).not.toContain("${r.apiKey}|${r.model}|${r.provider");
+    // Buckets are keyed by the full key internally (masking the bucket id
+    // collided keys that share a prefix), but every response-facing field is
+    // the masked form: `apiKeyMasked` for display, `apiKeyKey` for identity.
+    expect(source).toContain('const apiKeyKey = apiKeyMasked || "local-no-key";');
+    expect(source).toContain("apiKeyKey: apiKeyMasked");
+    expect(source).toContain("apiKeyMasked: maskApiKey(r.apiKey)");
+    // Every byApiKey bucket literal (daily rollup + 24h live) carries the masked
+    // fields and none of them hands the raw key back.
+    const buckets = source.match(/stats\.byApiKey\[[\w"-]+\] = \{[^}]*\}/g) || [];
+    expect(buckets.length).toBeGreaterThanOrEqual(2);
+    for (const bucket of buckets) {
+      expect(bucket).toContain("apiKeyMasked");
+      expect(bucket).toContain("apiKeyKey");
+      expect(bucket).not.toContain("apiKey: r.apiKey");
+    }
   });
 });
 

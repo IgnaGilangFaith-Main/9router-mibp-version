@@ -195,10 +195,12 @@ describe("WindsurfExecutor class", () => {
     expect(ex.buildUrl()).toBe(WS_CHAT_URL);
   });
 
-  // 8e04fe17 hid windsurf from the registry index (no tool calling), so PROVIDERS has no
-  // entry; the registry file and the executor fallback must still agree.
+  // Windsurf is a live registry provider again: the registry entry, the
+  // PROVIDERS table derived from it, and the executor fallback must all point at
+  // the same GetChatMessage endpoint.
   it("registry entry and executor fallback use the same chat endpoint (registry in sync)", () => {
-    expect(PROVIDERS.windsurf).toBeUndefined();
+    expect(PROVIDERS.windsurf).toBeDefined();
+    expect(PROVIDERS.windsurf.baseUrl).toBe(WS_CHAT_URL);
     expect(windsurfRegistry.transport.baseUrl).toBe(WS_CHAT_URL);
   });
 });

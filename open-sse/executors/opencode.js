@@ -53,7 +53,6 @@ function unstableRandom() {
 // Upstream decodes it and rejects a non-small counter with 403 FreeTierError
 // (live probes: counter 0–16 pass, >=100 fail), so the counter must stay real.
 const SESSION_PREFIX_MASK = (1n << 48n) - 1n;
-const SESSION_TIME_MASK = (1n << 36n) - 1n;
 
 function descendingTimeHex(time, counterValue) {
   return (~(BigInt(time) * 0x1000n + BigInt(counterValue)) & SESSION_PREFIX_MASK)
@@ -70,22 +69,47 @@ export function generateSessionId(timestamp = Date.now()) {
   return `ses_${descendingTimeHex(timestamp, counter)}${unstableRandom()}`;
 }
 
+// Mint a canonical session id from the real clock. The 12-hex prefix must
+// decode to a recent timestamp — Zen rejects a prefix built from anything else
+// (hash bits) with 403 FreeTierError — and the counter must stay small
+// (upstream probes: 0-16 pass, >=100 fail), so pin it to 1.
+function mintSessionId() {
+  return `ses_${descendingTimeHex(Date.now(), 1)}${unstableRandom()}`;
+}
+
+// One upstream session per (clientTool, downstream session) so a conversation
+// keeps a single id; minting a new one per request burns the free-tier quota
+// (429 FreeUsageLimitError).
+const translatedOpencodeSessions = new Map();
+const MAX_TRANSLATED_SESSIONS = 1000;
+const translatedSessionCleanup = setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of translatedOpencodeSessions) {
+    if (now - entry.lastUsed > MEMORY_CONFIG.sessionTtlMs) {
+      translatedOpencodeSessions.delete(key);
+    }
+  }
+}, MEMORY_CONFIG.sessionCleanupIntervalMs);
+if (translatedSessionCleanup.unref) translatedSessionCleanup.unref();
+
 export function translateSessionId(sessionId, clientTool = "") {
   if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
     return sessionId.trim();
   }
-  const digest = crypto
-    .createHash("sha256")
-    .update(`opencode\0${clientTool || "generic"}\0${sessionId || ""}`)
-    .digest();
-  // Deterministic time field from the digest, counter pinned to 1 (what the CLI sends).
-  const time = BigInt(`0x${digest.subarray(0, 5).toString("hex")}`) & SESSION_TIME_MASK;
-  const timeHex = descendingTimeHex(time, 1);
-  let randomPart = "";
-  for (let i = 6; i < 20; i++) {
-    randomPart += BASE62_CHARS[digest[i] % 62];
+  const key = `opencode:ses:${clientTool || "generic"}:${sessionId || ""}`;
+  const existing = translatedOpencodeSessions.get(key);
+  if (existing) {
+    existing.lastUsed = Date.now();
+    translatedOpencodeSessions.delete(key);
+    translatedOpencodeSessions.set(key, existing);
+    return existing.sessionId;
   }
-  return `ses_${timeHex}${randomPart}`;
+  const id = mintSessionId();
+  if (translatedOpencodeSessions.size >= MAX_TRANSLATED_SESSIONS) {
+    translatedOpencodeSessions.delete(translatedOpencodeSessions.keys().next().value);
+  }
+  translatedOpencodeSessions.set(key, { sessionId: id, lastUsed: Date.now() });
+  return id;
 }
 
 function normalizeSession(value) {
@@ -329,9 +353,44 @@ function dropAdaptiveReasoningEffort(body) {
   if (body?.reasoning_effort === "auto") delete body.reasoning_effort;
 }
 
+// FORK GUARD (AGENTS.md §5, proxy-pool fitness) — do not drop on an upstream
+// sync. Free-tier failures are pool-scoped: the same request can succeed from a
+// different egress, so they are reported (clearable) on the Proxy Fitness page
+// instead of dying at the first pool.
+const IP_LIMIT_BODY = /limit|rate|quota|exhausted|capacity|too many|retry/i;
+
+// Reputation blocks: the gateway refuses the egress IP outright ("detected
+// abusive traffic", "not available from your current network"). Same remedy as
+// a rate limit — the POOL's egress is bad, another pool may be clean — but the
+// body carries none of the words above, so it needs its own pattern.
+//
+// Deliberately NOT matched: the fingerprint 403 ("free tier can only be used
+// from within OpenCode"). That is a client-shape problem no pool rotation can
+// fix; marking pools unfit there would just burn quota retrying clean IPs.
+const IP_BLOCK_BODY = /abusive traffic|from your current network/i;
+
 export class OpenCodeExecutor extends BaseExecutor {
   constructor() {
     super("opencode", PROVIDERS.opencode);
+  }
+
+  parseError(response, bodyText) {
+    const status = response?.status || 0;
+    const text = String(bodyText || "");
+    if (status !== 429 && status !== 403) return null;
+    // Reputation block wins over the limit pattern: it is a per-egress-IP
+    // verdict from the gateway, so rotating to a clean pool is the only fix.
+    const reason = IP_BLOCK_BODY.test(text)
+      ? "ip-blocked"
+      : IP_LIMIT_BODY.test(text)
+        ? "ip-limit"
+        : null;
+    if (!reason) return null;
+    return {
+      status,
+      message: text.slice(0, 300) || `OpenCode free limit (${status})`,
+      poolScoped: { reason },
+    };
   }
 
   prepareRequestCredentials({ body, credentials, providerSessionId, clientTool } = {}) {

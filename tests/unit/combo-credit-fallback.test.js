@@ -2,10 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 import { handleComboChat } from "../../open-sse/services/combo.js";
 
 describe("combo credit fallback", () => {
+  // Credits/quota wording and plain request-scoped 400s both advance to the next
+  // member; only a stuck member set stops the combo (covered elsewhere).
   it.each([
     ["You have insufficient credits to make this request.", true],
     ["Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.", true],
-    ["Bad request", false],
+    ["Bad request", true],
   ])("routes a 400 response correctly: %s", async (message, shouldContinue) => {
     const body = { messages: [{ role: "user", content: "Hello" }] };
     const models = ["cmc/deepseek/deepseek-v4-pro", "mistral/mistral-medium-latest"];
