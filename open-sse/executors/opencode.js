@@ -343,10 +343,20 @@ function normalizeOpencodeReasoning(model, body) {
   delete body.reasoning_effort;
 }
 
-// OpenCode free tier is limited per egress IP — a 429/403 with a limit-ish
-// body means the POOL's IP is exhausted, not the account. Declare it
-// pool-scoped so chatCore marks the pool unfit, retries via another pool, and
-// it shows up (clearable) on the Proxy Fitness page.
+// Chat Completions lane: the free backend validates reasoning_effort against the
+// plain OpenAI enum (none|minimal|low|medium|high|xhigh|max) and answers 400
+// "Invalid option" for anything else — including "auto", which adaptive thinking
+// (Claude Code's thinking:{type:"adaptive"}) arrives as. Omitting the field lets
+// the upstream pick its own default, which is what adaptive means; same rationale
+// as the Responses path above, which rejects "unknown variant `auto`".
+function dropAdaptiveReasoningEffort(body) {
+  if (body?.reasoning_effort === "auto") delete body.reasoning_effort;
+}
+
+// FORK GUARD (AGENTS.md §5, proxy-pool fitness) — do not drop on an upstream
+// sync. Free-tier failures are pool-scoped: the same request can succeed from a
+// different egress, so they are reported (clearable) on the Proxy Fitness page
+// instead of dying at the first pool.
 const IP_LIMIT_BODY = /limit|rate|quota|exhausted|capacity|too many|retry/i;
 
 // Reputation blocks: the gateway refuses the egress IP outright ("detected
@@ -362,6 +372,25 @@ const IP_BLOCK_BODY = /abusive traffic|from your current network/i;
 export class OpenCodeExecutor extends BaseExecutor {
   constructor() {
     super("opencode", PROVIDERS.opencode);
+  }
+
+  parseError(response, bodyText) {
+    const status = response?.status || 0;
+    const text = String(bodyText || "");
+    if (status !== 429 && status !== 403) return null;
+    // Reputation block wins over the limit pattern: it is a per-egress-IP
+    // verdict from the gateway, so rotating to a clean pool is the only fix.
+    const reason = IP_BLOCK_BODY.test(text)
+      ? "ip-blocked"
+      : IP_LIMIT_BODY.test(text)
+        ? "ip-limit"
+        : null;
+    if (!reason) return null;
+    return {
+      status,
+      message: text.slice(0, 300) || `OpenCode free limit (${status})`,
+      poolScoped: { reason },
+    };
   }
 
   prepareRequestCredentials({ body, credentials, providerSessionId, clientTool } = {}) {
@@ -408,6 +437,7 @@ export class OpenCodeExecutor extends BaseExecutor {
       // non-empty tool arrays; skipping cloaking here triggers 403 FreeTierError.
       applyFingerprintTools(body, true);
     } else if (body && typeof body === "object") {
+      dropAdaptiveReasoningEffort(body);
       applyFingerprintTools(body, false);
     }
     return injectReasoningContent({ provider: this.provider, model, body });
@@ -452,24 +482,5 @@ export class OpenCodeExecutor extends BaseExecutor {
     };
     if (url.endsWith("/messages")) headers["anthropic-version"] = ANTHROPIC_API_VERSION;
     return headers;
-  }
-
-  parseError(response, bodyText) {
-    const status = response?.status || 0;
-    const text = String(bodyText || "");
-    if (status !== 429 && status !== 403) return null;
-    // Reputation block wins over the limit pattern: it is a per-egress-IP
-    // verdict from the gateway, so rotating to a clean pool is the only fix.
-    const reason = IP_BLOCK_BODY.test(text)
-      ? "ip-blocked"
-      : IP_LIMIT_BODY.test(text)
-        ? "ip-limit"
-        : null;
-    if (!reason) return null;
-    return {
-      status,
-      message: text.slice(0, 300) || `OpenCode free limit (${status})`,
-      poolScoped: { reason },
-    };
   }
 }
