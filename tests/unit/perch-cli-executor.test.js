@@ -11,6 +11,7 @@ vi.mock("node:child_process", () => ({
 }));
 
 const { default: PerchCliExecutor } = await import("open-sse/executors/perch-cli.js");
+const { buildPromptText } = await import("open-sse/executors/acp-prompt.js");
 
 function makeFakeChild({ authRequired = false } = {}) {
   const child = new EventEmitter();
@@ -134,7 +135,7 @@ const CREDENTIALS = {
   },
 };
 
-function makeFakeRunChild(stdout) {
+function makeFakeRunChild(stdout, { stderr = "", code = 0 } = {}) {
   const child = new EventEmitter();
   child.stdin = null;
   child.stdout = new EventEmitter();
@@ -144,14 +145,15 @@ function makeFakeRunChild(stdout) {
     child.killed = true;
   };
   child.finishRun = () => {
+    if (stderr) child.stderr.emit("data", Buffer.from(stderr));
     child.stdout.emit("data", Buffer.from(stdout));
-    child.emit("close", 0);
+    child.emit("close", code);
   };
   return child;
 }
 
-async function runPinned(stdout, model = "qwen-3.8-max") {
-  const child = makeFakeRunChild(stdout);
+async function runPinned(stdout, model = "qwen-3.8-max", runOpts = {}) {
+  const child = makeFakeRunChild(stdout, runOpts);
   spawnMock.mockReset();
   spawnMock.mockImplementation((bin, args, opts) => {
     child.bin = bin;
@@ -159,12 +161,13 @@ async function runPinned(stdout, model = "qwen-3.8-max") {
     child.opts = opts;
     return child;
   });
+  const warnings = [];
   const exec = new PerchCliExecutor();
   const { response } = await exec.execute({
     model,
     body: { messages: [{ role: "user", content: "hi" }] },
     credentials: CREDENTIALS,
-    log: { info() {}, debug() {} },
+    log: { info() {}, debug() {}, warn: (...a) => warnings.push(a.join(" ")) },
   });
   child.finishRun();
   const reader = response.body.getReader();
@@ -174,7 +177,7 @@ async function runPinned(stdout, model = "qwen-3.8-max") {
     if (done) break;
     acc += new TextDecoder().decode(value);
   }
-  return { acc, child };
+  return { acc, child, warnings };
 }
 
 const written = (child) => child.writes.map((w) => JSON.parse(w.trim()));
@@ -293,5 +296,65 @@ describe("PerchCliExecutor named model flow", () => {
     );
     expect(acc).toContain("Choose Starter");
     expect(acc).toContain("chat.perchai.app");
+  });
+
+  it("matches the interactive plan refusal wording too", async () => {
+    const { acc } = await runPinned(
+      JSON.stringify({
+        ok: true,
+        status: "completed",
+        assistantText: "Perch needs a plan on this account before it can answer.",
+        events: [],
+      }),
+    );
+    expect(acc).toContain("Choose Starter");
+  });
+
+  it("treats status failed as failure even without ok:false", async () => {
+    const { acc, warnings } = await runPinned(
+      JSON.stringify({
+        status: "failed",
+        assistantText: "",
+        error: "model route exhausted",
+        events: [],
+      }),
+    );
+    expect(acc).toContain("model route exhausted");
+    expect(acc).not.toContain('"finish_reason":"stop"');
+    expect(warnings.join("\n")).toContain("model route exhausted");
+  });
+
+  it("surfaces event errors when ok is true but text is empty", async () => {
+    const { acc } = await runPinned(
+      JSON.stringify({
+        ok: true,
+        status: "completed",
+        assistantText: "",
+        events: [{ type: "model_call_failed", error: "This model's quota is used up for now." }],
+      }),
+    );
+    expect(acc).toContain("quota is used up");
+    expect(acc).not.toContain("empty reply");
+  });
+
+  it("includes exit code and stderr when stdout is not JSON", async () => {
+    const { acc } = await runPinned("", "qwen-3.8-max", {
+      stderr: "Unknown model: qwen-3.8-max. Try a tier (standard, pro)",
+      code: 1,
+    });
+    expect(acc).toContain("exit 1");
+    expect(acc).toContain("Unknown model");
+  });
+});
+
+describe("buildPromptText content parts", () => {
+  it("keeps Responses-style input_text/output_text parts", () => {
+    const text = buildPromptText([
+      { role: "user", content: [{ type: "input_text", text: "list files" }] },
+      { role: "assistant", content: [{ type: "output_text", text: "here" }] },
+    ]);
+    expect(text).toContain("list files");
+    expect(text).toContain("here");
+    expect(text).not.toBe("(empty)");
   });
 });

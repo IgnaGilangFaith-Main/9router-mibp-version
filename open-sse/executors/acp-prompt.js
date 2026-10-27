@@ -11,8 +11,16 @@ export function buildPromptText(messages) {
       text = m.content;
     } else if (Array.isArray(m.content)) {
       for (const p of m.content) {
+        if (typeof p === "string") {
+          text += p;
+          continue;
+        }
         if (!p || typeof p !== "object") continue;
-        if (p.type === "text") text += String(p.text || "");
+        // Responses-style parts use input_text/output_text with the same
+        // shape as chat `text` parts — same convention as
+        // muse-web/prompt.js and chatgpt-web/adapter.js.
+        if (p.type === "text" || p.type === "input_text" || p.type === "output_text")
+          text += String(p.text ?? p.input_text ?? "");
         else if (p.type === "tool_use") {
           text += `\n[Tool call ${p.name} id=${p.id}]\n${JSON.stringify(p.input ?? {})}\n`;
         } else if (p.type === "tool_result") {

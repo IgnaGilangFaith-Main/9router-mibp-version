@@ -146,19 +146,27 @@ function parsePerchRunJson(stdout) {
   }
 }
 
-function perchRunError(parsed) {
-  const err = parsed?.error;
-  if (typeof err === "string" && err) return err;
-  if (err?.message) return err.message;
+// Last failing model/turn event, if any — surfaced instead of a generic
+// "empty reply" when the CLI ran but produced no text (e.g. quota/route
+// failure recorded in events while `ok` stayed truthy).
+function eventFailure(parsed) {
   const events = Array.isArray(parsed?.events) ? parsed.events : [];
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i];
     if (event?.type === "turn_failed" || event?.type === "model_call_failed") {
       const msg = event.error || event.message;
       if (msg) return String(msg);
+      if (event.limit?.limitKind) return `Perch limit reached (${event.limit.limitKind})`;
     }
   }
-  return `Perch run failed (${parsed?.status || "unknown"})`;
+  return null;
+}
+
+function perchRunError(parsed) {
+  const err = parsed?.error;
+  if (typeof err === "string" && err) return err;
+  if (err?.message) return err.message;
+  return eventFailure(parsed) || `Perch run failed (${parsed?.status || "unknown"})`;
 }
 
 export class PerchCliExecutor extends BaseExecutor {
@@ -338,36 +346,55 @@ export class PerchCliExecutor extends BaseExecutor {
           }
 
           let stdout = "";
+          let stderr = "";
           child.stdout.on("data", (chunk) => {
             stdout += chunk.toString("utf8");
           });
           child.stderr.on("data", (chunk) => {
+            stderr += chunk.toString("utf8");
             log?.debug?.("PERCH", `stderr: ${chunk.toString("utf8").slice(0, 200)}`);
           });
           child.on("error", (err) => finish(spawnErrorMessage(err)));
-          child.on("close", () => {
+          child.on("close", (code) => {
             if (finished) return;
             const parsed = parsePerchRunJson(stdout);
+            const stderrTail = stderr.trim().split("\n").slice(-3).join("\n").slice(0, 500);
+            // A finish(error) emits an error chunk with no usage, so combo
+            // logs show only "empty (no-content)". Log the cause server-side.
+            const fail = (message) => {
+              log?.warn?.(
+                "PERCH",
+                `run --model ${pinnedModel} failed: ${message} (status=${parsed?.status ?? "?"}, exit=${code}${stderrTail ? `, stderr=${stderrTail}` : ""})`
+              );
+              finish(message);
+            };
             if (!parsed) {
-              const firstLine = stdout.trim().split("\n")[0]?.slice(0, 200);
-              finish(
-                firstLine
-                  ? `Perch CLI: ${firstLine}`
-                  : "Perch CLI returned no output. Check `perch status` and CLI_PERCH_BIN."
+              fail(
+                stderrTail
+                  ? `Perch CLI failed (exit ${code}): ${stderrTail}`
+                  : (() => {
+                      const firstLine = stdout.trim().split("\n")[0]?.slice(0, 200);
+                      return firstLine
+                        ? `Perch CLI: ${firstLine}`
+                        : `Perch CLI returned no output (exit ${code}). Check \`perch status\` and CLI_PERCH_BIN.`;
+                    })()
               );
               return;
             }
-            if (parsed.ok === false) {
-              finish(perchRunError(parsed));
+            if (parsed.ok === false || parsed.status === "failed") {
+              fail(perchRunError(parsed));
               return;
             }
             const text = typeof parsed.assistantText === "string" ? parsed.assistantText : "";
             if (!text.trim()) {
-              finish("Perch returned an empty reply.");
+              fail(eventFailure(parsed) || "Perch returned an empty reply.");
               return;
             }
-            if (/needs a plan before Perch can answer/i.test(text)) {
-              finish(
+            // CLI refusal wording: "Perch needs a plan on this account before
+            // it can answer." (interactive) / "This account needs a plan
+            // before Perch can answer. ..." (headless).
+            if (/needs a plan .*before .* can answer/i.test(text)) {
+              fail(
                 "This Perch account has no plan yet. Choose Starter at https://chat.perchai.app (or run `perch` once) and retry."
               );
               return;
